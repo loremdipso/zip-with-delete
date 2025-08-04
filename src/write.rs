@@ -18,6 +18,7 @@ use core::num::NonZeroU64;
 use crc32fast::Hasher;
 use indexmap::IndexMap;
 use std::borrow::ToOwned;
+use std::collections::HashMap;
 use std::default::Default;
 use std::fmt::{Debug, Formatter};
 use std::io;
@@ -161,7 +162,10 @@ pub(crate) mod zip_writer {
     /// ```
     pub struct ZipWriter<W: Write + Seek> {
         pub(super) inner: GenericZipWriter<W>,
-        pub(super) files: IndexMap<Box<str>, ZipFileData>,
+
+        // I made this readable for me! Probably not something we want to keep
+        pub(crate) files: IndexMap<Box<str>, ZipFileData>,
+
         pub(super) stats: ZipWriterStats,
         pub(super) writing_to_file: bool,
         pub(super) writing_raw: bool,
@@ -3908,4 +3912,170 @@ mod test {
 
         Ok(())
     }
+}
+
+/// Trait that adds update functionality to zip
+pub trait UpdateZip<A: Read + Write + Seek> {
+    /// Delete files from a zip. Will be wrong if the zip was already modified
+    fn delete_files(&mut self, filenames: &[String]) -> ZipResult<()>;
+}
+
+// impl<A: Read + Write + Seek> UpdateZip<A> for ZipWriter<A> {
+impl UpdateZip<std::fs::File> for ZipWriter<std::fs::File> {
+    /// Delete a group of files all at once.
+    fn delete_files(&mut self, filenames: &[String]) -> ZipResult<()> {
+        let writer = self.inner.get_plain();
+
+        // Just in case...
+        if filenames.is_empty() {
+            return Ok(());
+        }
+
+        let mut paddings = HashMap::new();
+        let mut central_header_start = u64::MAX;
+        let mut all_files = self.files.values().collect::<Vec<_>>();
+        all_files.sort_by_key(|file| file.header_start);
+        for window in all_files.windows(2) {
+            if window[0].central_header_start > 0 {
+                central_header_start = central_header_start.min(window[0].central_header_start);
+            }
+            if window[1].central_header_start > 0 {
+                central_header_start = central_header_start.min(window[1].central_header_start);
+            }
+
+            paddings.insert(
+                window[0].file_name.to_string(),
+                window[1].header_start - get_end_of_data(window[0], &HashMap::default()),
+            );
+        }
+
+        if central_header_start < u64::MAX {
+            let last_file = all_files[all_files.len() - 1];
+            let padding = central_header_start - get_end_of_data(last_file, &HashMap::default());
+            paddings.insert(last_file.file_name.to_string(), padding);
+        }
+
+        let mut gaps = vec![];
+        for filename in filenames {
+            if let Some(data) = self.files.shift_remove(filename.as_str()) {
+                gaps.push((data.header_start, data.compressed_size));
+            }
+        }
+
+        if gaps.is_empty() {
+            return Ok(());
+        }
+
+        gaps.sort_by_key(|(start, _)| *start);
+
+        let mut files = self.files.values_mut().collect::<Vec<_>>();
+        files.sort_by_key(|file| file.header_start);
+
+        // Deals with how much we've mucked about with things
+        let mut gap_index = 0;
+        let mut file_index = 0;
+
+        let mut start_of_empty_space = gaps[gap_index].0;
+
+        'outer: while file_index < files.len() && gap_index < gaps.len() {
+            // Skip things that don't need to move
+            while files[file_index].header_start < gaps[gap_index].0 {
+                file_index += 1;
+                if file_index >= files.len() {
+                    break 'outer;
+                }
+            }
+
+            // Skip contiguous items in the gap
+            while files[file_index].header_start > gaps[gap_index].0 {
+                gap_index += 1;
+                if gap_index >= gaps.len() {
+                    break 'outer;
+                }
+            }
+
+            // Skip contiguous files
+            let file_index_start = file_index;
+            // println!("Gap index: {}", gap_index);
+            while files[file_index].header_start < gaps[gap_index].0 {
+                file_index += 1;
+                if file_index >= files.len() {
+                    file_index = file_index_start;
+                    break 'outer;
+                }
+            }
+
+            let file_index_end = (file_index - 1).max(file_index_start);
+            let start_of_data = files[file_index_start].header_start;
+            let end_of_data = get_end_of_data(&files[file_index_end], &paddings);
+            let total_skipped = start_of_data - start_of_empty_space;
+
+            writer.seek(SeekFrom::Start(start_of_data))?;
+            let buffer_size = end_of_data - start_of_data;
+            let mut buf = vec![0; buffer_size as usize];
+            if let Err(_) = writer.read_exact(&mut buf) {
+                println!("Didn't read to end...");
+            }
+            writer.seek(SeekFrom::Start(start_of_empty_space))?;
+            writer.write_all(&buf)?;
+
+            // Update the affected files
+            for index in file_index_start..=file_index_end {
+                files[index].header_start -= total_skipped;
+                start_of_empty_space = get_end_of_data(&files[index], &paddings);
+            }
+
+            file_index = file_index_end + 1;
+        }
+
+        // Leftovers - move over
+        if file_index < files.len() {
+            let start_of_data = files[file_index].header_start;
+            let total_skipped = start_of_data - start_of_empty_space;
+            writer.seek(SeekFrom::Start(start_of_data))?;
+
+            let end_of_data = get_end_of_data(&files[files.len() - 1], &paddings);
+            let buffer_size = end_of_data - start_of_data;
+
+            let mut buf = vec![0; buffer_size as usize];
+            if let Err(_) = writer.read_exact(&mut buf) {
+                println!("Didn't read to end...");
+            }
+            writer.seek(SeekFrom::Start(start_of_empty_space))?;
+            writer.write_all(&buf)?;
+
+            for file_index in file_index..files.len() {
+                files[file_index].header_start -= total_skipped;
+            }
+        }
+
+        self.writing_to_file = false;
+
+        self.write_central_and_footer()?;
+        let writer = self.inner.get_plain();
+        let new_file_end = writer.stream_position()?;
+
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.set_len(new_file_end).unwrap();
+
+        self.inner = Closed;
+        Ok(())
+    }
+}
+
+fn get_end_of_data(file: &ZipFileData, paddings: &HashMap<String, u64>) -> u64 {
+    // TODO: why do we need this weird padding???
+    // (file.header_start + file.compressed_size) + file.extra_field_len() as u64
+    // (file.header_start + file.compressed_size) + file.extra_field_len() as u64 + padding + 64
+    let padding = if let Some(padding) = paddings.get(&*file.file_name) {
+        *padding
+    } else {
+        paddings
+            .values()
+            .next()
+            .map(|e| e.to_owned())
+            .unwrap_or_default()
+    };
+    // println!("Found padding: {} for {}", padding, file.file_name);
+    (file.header_start + file.compressed_size) + file.extra_field_len() as u64 + padding
 }

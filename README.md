@@ -1,96 +1,36 @@
-zip
-========
+# Zip (but with delete, too!)
 
-[![Build Status](https://github.com/zip-rs/zip2/actions/workflows/ci.yaml/badge.svg)](https://github.com/Pr0methean/zip/actions?query=branch%3Amaster+workflow%3ACI)
-[![Crates.io version](https://img.shields.io/crates/v/zip.svg)](https://crates.io/crates/zip)
+Fixes [#166](https://github.com/zip-rs/zip2/issues/166).
 
-[Documentation](https://docs.rs/zip/latest/zip/)
+Eventually the goal is to get this crate cleaned up and merged into the mainline zip crate. I'm making this public now since, well, I need it, but if you find this and aren't afraid of untested code then you're welcome to use this too :)
 
-Info
-----
+## The idea
 
+Since the [zip file format](https://en.wikipedia.org/wiki/ZIP_(file_format)) can have arbitrary data embedded in it, I took the approach of conserving whatever data I could. So rather than relying on a zip file's purported size I assume that all of the bytes between the start of a file's header and the start of the next file's header are the file's data. So if a zip file has junk before editing then that junk will be maintained after, which in practice I've found to be the most stable.
 
-A zip library for rust which supports reading and writing of simple ZIP files. Formerly hosted at 
-https://github.com/zip-rs/zip2.
+## Usage
 
-Supported compression formats:
+```rust
+use zip::write::{UpdateZip};
 
-* stored (i.e. none)
-* deflate
-* deflate64 (decompression only)
-* bzip2
-* zstd
-* lzma (decompression only)
-* xz (decompression only)
-* ppmd
+let mut zip_file = zip::ZipWriter::new_editor(
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(archive)
+        .expect("Can't open file")
+).expect("Can't edit zip");
 
-Currently unsupported zip extensions:
-
-* Multi-disk
-
-Features
---------
-
-The features available are:
-
-* `aes-crypto`: Enables decryption of files which were encrypted with AES. Supports AE-1 and AE-2 methods.
-* `deflate`: Enables compressing and decompressing an unspecified implementation (that may change in future versions) of
- the deflate compression algorithm, which is the default for zip files. Supports compression quality 1..=264.
-* `deflate-flate2`: Combine this with any `flate2` feature flag that enables a back-end, to support deflate compression 
-  at quality 1..=9.
-* `deflate-zopfli`: Enables deflating files with the `zopfli` library (used when compression quality is 10..=264). This
-  is the most effective `deflate` implementation available, but also among the slowest.
-* `deflate64`: Enables the deflate64 compression algorithm. Only decompression is supported.
-* `lzma`: Enables the LZMA compression algorithm. Only decompression is supported.
-* `bzip2`: Enables the BZip2 compression algorithm.
-* `ppmd`: Enables the PPMd compression algorithm.
-* `time`: Enables features using the [time](https://github.com/rust-lang-deprecated/time) crate.
-* `chrono`: Enables converting last-modified `zip::DateTime` to and from `chrono::NaiveDateTime`.
-* `jiff-02`: Enables converting last-modified `zip::DateTime` to and from `jiff::civil::DateTime`.
-* `nt-time`: Enables returning timestamps stored in the NTFS extra field as `nt_time::FileTime`.
-* `zstd`: Enables the Zstandard compression algorithm.
-
-By default `aes-crypto`, `bzip2`, `deflate`, `deflate64`, `lzma`, `ppmd`, `time` and `zstd` are enabled.
-
-MSRV
-----
-
-Our current Minimum Supported Rust Version is **1.82**. When adding features,
-we will follow these guidelines:
-
-- We will always support a minor Rust version that has been stable for at least 6 months.
-- Any change to the MSRV will be accompanied with a **minor** version bump.
-
-Examples
---------
-
-See the [examples directory](examples) for:
-   * How to write a file to a zip.
-   * How to write a directory of files to a zip (using [walkdir](https://github.com/BurntSushi/walkdir)).
-   * How to extract a zip file.
-   * How to extract a single file from a zip.
-   * How to read a zip from the standard input.
-   * How to append a directory to an existing archive
-
-Fuzzing
--------
-
-Fuzzing support is through [cargo afl](https://rust-fuzz.github.io/book/afl.html). To install cargo afl:
-
-```bash
-cargo install cargo-afl
+let filenames_to_delete = vec!["01.txt", "02.txt"];
+zip_file.delete_files(&filenames_to_delete).expect("Issue deleting files");
 ```
 
-To start fuzzing zip extraction:
+## Performance
 
-```bash
-cargo +nightly afl build --all-features --manifest-path fuzz_read/Cargo.toml
-cargo +nightly afl run fuzz_read/target/debug/fuzz_read
-```
+tl;dr - basically instant :) When deleting multiple files this copies the minimum amount of data. Rather than shifting the entire remainder of the file over to cover up holes this does what you would do intuitively, and just shifts until the next hole.
 
-To start fuzzing zip creation:
+Back-of-the-envelope, on the examples I was able to get my hands on this takes <10ms to remove 10 files from an archive with 500 files. Smaller archives are done so fast it's a little difficult to measure. Doing a more traditional copy-all-the-files-except-the-ones-I-want-to-delete takes on the order of ~200ms or so, on my machine. Even the worst case, where you delete nearly all of the files, is faster than creating a new archive (for me).
 
-```bash
-cargo +nightly afl build --all-features --manifest-path fuzz_write/Cargo.toml
-cargo +nightly afl run fuzz_write/target/debug/fuzz_write
-```
+## Stability
+
+I'm happy with how stable this is, but as you can see I haven't written any tests. Use at your own risk!
