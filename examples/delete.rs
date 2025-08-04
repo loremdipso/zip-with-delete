@@ -1,9 +1,4 @@
-use std::{
-    fs::{File, OpenOptions},
-    path::PathBuf,
-    str::FromStr,
-};
-use zip::write::SimpleFileOptions;
+use std::{fs::OpenOptions, path::PathBuf, str::FromStr};
 
 fn main() {
     std::process::exit(real_main());
@@ -21,12 +16,9 @@ fn real_main() -> i32 {
 
     let existing_archive_path = &*args[1];
     let archive = PathBuf::from_str(existing_archive_path).unwrap();
-    let to_append = args[2..]
-        .iter()
-        .map(|arg| PathBuf::from_str(arg).unwrap())
-        .collect::<Vec<_>>();
+    let to_delete = args[2..].iter().collect::<Vec<_>>();
 
-    let mut append_zip = zip::ZipEditor::new(
+    let zip_editor = zip::ZipEditor::new(
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -35,7 +27,9 @@ fn real_main() -> i32 {
     )
     .unwrap();
 
-    append_zip.finish().unwrap();
+    zip_editor
+        .delete_files(&to_delete)
+        .expect("Couldn't delete files");
 
     0
 }

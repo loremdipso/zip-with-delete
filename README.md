@@ -11,9 +11,7 @@ Since the [zip file format](https://en.wikipedia.org/wiki/ZIP_(file_format)) can
 ## Usage
 
 ```rust
-use zip::write::{UpdateZip};
-
-let mut zip_file = zip::ZipWriter::new_editor(
+let zip_editor = zip::ZipEditor::new(
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -22,8 +20,12 @@ let mut zip_file = zip::ZipWriter::new_editor(
 ).expect("Can't edit zip");
 
 let filenames_to_delete = vec!["01.txt", "02.txt"];
-zip_file.delete_files(&filenames_to_delete).expect("Issue deleting files");
+zip_editor.delete_files(&filenames_to_delete).expect("Issue deleting files");
 ```
+
+I've also included some basic function to read from the archive, since that's helpful in my use-case.
+
+Deleting files from an editable archive is low priority for me, so I opted to not allow that.
 
 ## Performance
 

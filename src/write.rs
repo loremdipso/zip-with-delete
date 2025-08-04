@@ -3,7 +3,10 @@
 #[cfg(feature = "aes-crypto")]
 use crate::aes::AesWriter;
 use crate::compression::CompressionMethod;
-use crate::read::{parse_single_extra_field, Config, ZipArchive, ZipFile};
+use crate::read::{
+    find_content, make_crypto_reader, make_reader, parse_single_extra_field, Config, ZipArchive,
+    ZipFile, ZipFileReader,
+};
 use crate::result::{invalid, ZipError, ZipResult};
 use crate::spec::{self, FixedSizeBlock, Zip32CDEBlock};
 #[cfg(feature = "aes-crypto")]
@@ -17,7 +20,7 @@ use crate::write::ffi::S_IFLNK;
 use core::num::NonZeroU64;
 use crc32fast::Hasher;
 use indexmap::IndexMap;
-use std::borrow::ToOwned;
+use std::borrow::{Cow, ToOwned};
 use std::collections::HashMap;
 use std::default::Default;
 use std::fmt::{Debug, Formatter};
@@ -3914,26 +3917,33 @@ mod test {
     }
 }
 
-/// Trait that adds update functionality to zip
-pub trait UpdateZip<A: Read + Write + Seek> {
-    /// Delete files from a zip. Will be wrong if the zip was already modified
-    fn delete_files(&mut self, filenames: &[String]) -> ZipResult<()>;
+/// Container that allows reads and deleting files
+pub struct ZipEditor<A: Read + Write + Seek> {
+    inner: ZipWriter<A>,
 }
 
-// impl<A: Read + Write + Seek> UpdateZip<A> for ZipWriter<A> {
-impl UpdateZip<std::fs::File> for ZipWriter<std::fs::File> {
+impl ZipEditor<std::fs::File> {
+    /// Creates a new zip editor
+    pub fn new(readwriter: std::fs::File) -> ZipResult<ZipEditor<std::fs::File>> {
+        Ok(Self {
+            inner: ZipWriter::new_append(readwriter)?,
+        })
+    }
+
     /// Delete a group of files all at once.
-    fn delete_files(&mut self, filenames: &[String]) -> ZipResult<()> {
-        let writer = self.inner.get_plain();
+    /// Consumes the file descriptor since not doing so is more complicated.
+    pub fn delete_files<S: AsRef<str>>(mut self, filenames_to_delete: &[S]) -> ZipResult<()> {
+        // TODO: make sure calling this more than once works!!!
+        let writer = self.inner.inner.get_plain();
 
         // Just in case...
-        if filenames.is_empty() {
+        if filenames_to_delete.is_empty() {
             return Ok(());
         }
 
         let mut paddings = HashMap::new();
         let mut central_header_start = u64::MAX;
-        let mut all_files = self.files.values().collect::<Vec<_>>();
+        let mut all_files = self.inner.files.values().collect::<Vec<_>>();
         all_files.sort_by_key(|file| file.header_start);
         for window in all_files.windows(2) {
             if window[0].central_header_start > 0 {
@@ -3956,8 +3966,8 @@ impl UpdateZip<std::fs::File> for ZipWriter<std::fs::File> {
         }
 
         let mut gaps = vec![];
-        for filename in filenames {
-            if let Some(data) = self.files.shift_remove(filename.as_str()) {
+        for filename in filenames_to_delete {
+            if let Some(data) = self.inner.files.shift_remove(filename.as_ref()) {
                 gaps.push((data.header_start, data.compressed_size));
             }
         }
@@ -3968,7 +3978,7 @@ impl UpdateZip<std::fs::File> for ZipWriter<std::fs::File> {
 
         gaps.sort_by_key(|(start, _)| *start);
 
-        let mut files = self.files.values_mut().collect::<Vec<_>>();
+        let mut files = self.inner.files.values_mut().collect::<Vec<_>>();
         files.sort_by_key(|file| file.header_start);
 
         // Deals with how much we've mucked about with things
@@ -4049,17 +4059,108 @@ impl UpdateZip<std::fs::File> for ZipWriter<std::fs::File> {
             }
         }
 
-        self.writing_to_file = false;
+        self.inner.writing_to_file = false;
 
-        self.write_central_and_footer()?;
-        let writer = self.inner.get_plain();
+        self.inner.write_central_and_footer()?;
+        let writer = self.inner.inner.get_plain();
         let new_file_end = writer.stream_position()?;
 
         writer.seek(SeekFrom::Start(0)).unwrap();
         writer.set_len(new_file_end).unwrap();
 
-        self.inner = Closed;
+        self.inner.inner = Closed;
         Ok(())
+    }
+
+    /// For my own convenience I copy-pasted some useful functions from the read version.
+
+    /// Returns an iterator over all the file and directory names in this archive.
+    pub fn file_names(&self) -> impl Iterator<Item = &str> {
+        self.inner.files.keys().map(|s| s.as_ref())
+    }
+
+    /// Search for a file entry by name
+    pub fn by_name(&mut self, name: &str) -> ZipResult<ZipFile<'_, std::fs::File>> {
+        self.by_name_with_optional_password(name, None)
+    }
+
+    fn by_name_with_optional_password<'a>(
+        &'a mut self,
+        name: &str,
+        password: Option<&[u8]>,
+    ) -> ZipResult<ZipFile<'a, std::fs::File>> {
+        let Some(index) = self.inner.files.get_index_of(name) else {
+            return Err(ZipError::FileNotFound);
+        };
+        self.by_index_with_optional_password(index, password)
+    }
+
+    /// Get a contained file by index, decrypt with given password
+    ///
+    /// # Warning
+    ///
+    /// The implementation of the cryptographic algorithms has not
+    /// gone through a correctness review, and you should assume it is insecure:
+    /// passwords used with this API may be compromised.
+    ///
+    /// This function sometimes accepts wrong password. This is because the ZIP spec only allows us
+    /// to check for a 1/256 chance that the password is correct.
+    /// There are many passwords out there that will also pass the validity checks
+    /// we are able to perform. This is a weakness of the ZipCrypto algorithm,
+    /// due to its fairly primitive approach to cryptography.
+    pub fn by_index_decrypt(
+        &mut self,
+        file_number: usize,
+        password: &[u8],
+    ) -> ZipResult<ZipFile<'_, std::fs::File>> {
+        self.by_index_with_optional_password(file_number, Some(password))
+    }
+
+    /// Get a contained file by index
+    pub fn by_index(&mut self, file_number: usize) -> ZipResult<ZipFile<'_, std::fs::File>> {
+        self.by_index_with_optional_password(file_number, None)
+    }
+
+    /// Get a contained file by index without decompressing it
+    pub fn by_index_raw(&mut self, file_number: usize) -> ZipResult<ZipFile<'_, std::fs::File>> {
+        let reader = self.inner.inner.get_plain();
+        let (_, data) = self
+            .inner
+            .files
+            .get_index(file_number)
+            .ok_or(ZipError::FileNotFound)?;
+        Ok(ZipFile {
+            reader: ZipFileReader::Raw(find_content(data, reader)?),
+            data: Cow::Borrowed(data),
+        })
+    }
+
+    fn by_index_with_optional_password(
+        &mut self,
+        file_number: usize,
+        mut password: Option<&[u8]>,
+    ) -> ZipResult<ZipFile<'_, std::fs::File>> {
+        let (_, data) = self
+            .inner
+            .files
+            .get_index(file_number)
+            .ok_or(ZipError::FileNotFound)?;
+
+        match (password, data.encrypted) {
+            (None, true) => return Err(ZipError::UnsupportedArchive(ZipError::PASSWORD_REQUIRED)),
+            (Some(_), false) => password = None, //Password supplied, but none needed! Discard.
+            _ => {}
+        }
+
+        let reader = self.inner.inner.get_plain();
+        let limit_reader = crate::read::find_content(data, reader)?;
+
+        let crypto_reader = make_crypto_reader(data, limit_reader, password, data.aes_mode)?;
+
+        Ok(ZipFile {
+            data: Cow::Borrowed(data),
+            reader: make_reader(data.compression_method, data.crc32, crypto_reader)?,
+        })
     }
 }
 
