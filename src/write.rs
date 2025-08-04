@@ -3918,6 +3918,7 @@ mod test {
 }
 
 /// Container that allows reads and deleting files
+#[derive(Debug)]
 pub struct ZipEditor<A: Read + Write + Seek> {
     inner: ZipWriter<A>,
 }
@@ -4161,6 +4162,11 @@ impl ZipEditor<std::fs::File> {
             data: Cow::Borrowed(data),
             reader: make_reader(data.compression_method, data.crc32, crypto_reader)?,
         })
+    }
+
+    /// Number of files contained in this zip.
+    pub fn len(&self) -> usize {
+        self.inner.files.len()
     }
 }
 
